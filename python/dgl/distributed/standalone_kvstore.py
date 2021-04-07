@@ -13,8 +13,14 @@ class KVClient(object):
     '''
     def __init__(self):
         self._data = {}
+        self._all_possible_part_policy = {}
         self._push_handlers = {}
         self._pull_handlers = {}
+
+    @property
+    def all_possible_part_policy(self):
+        """Get all possible partition policies"""
+        return self._all_possible_part_policy
 
     def barrier(self):
         '''barrier'''
@@ -27,13 +33,21 @@ class KVClient(object):
         '''register pull handler'''
         self._pull_handlers[name] = func
 
-    def add_data(self, name, tensor):
+    def add_data(self, name, tensor, part_policy):
         '''add data to the client'''
         self._data[name] = tensor
+        if part_policy.policy_str not in self._all_possible_part_policy:
+            self._all_possible_part_policy[part_policy.policy_str] = part_policy
 
-    def init_data(self, name, shape, dtype, _, init_func):
+    def init_data(self, name, shape, dtype, part_policy, init_func):
         '''add new data to the client'''
         self._data[name] = init_func(shape, dtype)
+        if part_policy.policy_str not in self._all_possible_part_policy:
+            self._all_possible_part_policy[part_policy.policy_str] = part_policy
+
+    def delete_data(self, name):
+        '''delete the data'''
+        del self._data[name]
 
     def data_name_list(self):
         '''get the names of all data'''
@@ -56,3 +70,6 @@ class KVClient(object):
             return self._pull_handlers[name](self._data, name, id_tensor)
         else:
             return F.gather_row(self._data[name], id_tensor)
+
+    def map_shared_data(self, partition_book):
+        '''Mapping shared-memory tensor from server to client.'''

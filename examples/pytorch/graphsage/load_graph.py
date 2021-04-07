@@ -6,19 +6,10 @@ def load_reddit():
 
     # load reddit data
     data = RedditDataset(self_loop=True)
-    train_mask = data.train_mask
-    val_mask = data.val_mask
-    features = th.Tensor(data.features)
-    labels = th.LongTensor(data.labels)
-
-    # Construct graph
-    g = data.graph
-    g.ndata['features'] = features
-    g.ndata['labels'] = labels
-    g.ndata['train_mask'] = th.BoolTensor(data.train_mask)
-    g.ndata['val_mask'] = th.BoolTensor(data.val_mask)
-    g.ndata['test_mask'] = th.BoolTensor(data.test_mask)
-    return g, data.num_labels
+    g = data[0]
+    g.ndata['features'] = g.ndata['feat']
+    g.ndata['labels'] = g.ndata['label']
+    return g, data.num_classes
 
 def load_ogb(name):
     from ogb.nodeproppred import DglNodePropPredDataset

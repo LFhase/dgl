@@ -1,12 +1,11 @@
 """Module for sparse matrix operators."""
 # pylint: disable= invalid-name
 from __future__ import absolute_import
-
-import dgl.ndarray as nd
+from . import ndarray as nd
 from ._ffi.function import _init_api
 from .base import DGLError
-from .utils import to_dgl_context
 from . import backend as F
+
 
 def infer_broadcast_shape(op, shp1, shp2):
     r"""Check the shape validity, and infer the output shape given input shape and operator.
@@ -54,13 +53,16 @@ def infer_broadcast_shape(op, shp1, shp2):
     rst = tuple(max(d1, d2) for d1, d2 in zip(pad_shp1, pad_shp2))
     return rst[:-1] + (1,) if op == "dot" else rst
 
+
 def to_dgl_nd(x):
     """Convert framework-specific tensor/None to dgl ndarray."""
     return nd.NULL['int64'] if x is None else F.zerocopy_to_dgl_ndarray(x)
 
+
 def to_dgl_nd_for_write(x):
     """Convert framework-specific tensor/None to dgl ndarray for write."""
     return nd.NULL['int64'] if x is None else F.zerocopy_to_dgl_ndarray_for_write(x)
+
 
 target_mapping = {
     'u': 0,
@@ -70,6 +72,7 @@ target_mapping = {
     'edge': 1,
     'dst': 2
 }
+
 
 def _gspmm(gidx, op, reduce_op, u, e):
     r""" Generalized Sparse Matrix Multiplication interface. It takes the result of
@@ -110,49 +113,71 @@ def _gspmm(gidx, op, reduce_op, u, e):
 
     Notes
     -----
-    This function does not handle gradients, and for scalar input features,
-    we expand its dimension with an additional dimension of length one. (e.g.
-    (90,) to (90, 1) for a graph with 90 nodes/edges).
+    This function does not handle gradients.
     """
     if gidx.number_of_etypes() != 1:
-        raise DGLError("We only support gsddmm on graph with one edge type")
+        raise DGLError("We only support gspmm on graph with one edge type")
     use_u = op != 'copy_rhs'
     use_e = op != 'copy_lhs'
+    if use_u and use_e:
+        if F.dtype(u) != F.dtype(e):
+            raise DGLError("The node features' data type {} doesn't match edge"
+                           " features' data type {}, please convert them to the"
+                           " same type.".format(F.dtype(u), F.dtype(e)))
+    # deal with scalar features.
+    expand_u, expand_e = False, False
     if use_u:
         if F.ndim(u) == 1:
             u = F.unsqueeze(u, -1)
+            expand_u = True
     if use_e:
         if F.ndim(e) == 1:
             e = F.unsqueeze(e, -1)
-    if gidx.number_of_etypes() != 1:
-        raise DGLError("We only support gspmm on graph with one edge type")
+            expand_e = True
 
     ctx = F.context(u) if use_u else F.context(e)
     dtype = F.dtype(u) if use_u else F.dtype(e)
     u_shp = F.shape(u) if use_u else (0,)
     e_shp = F.shape(e) if use_e else (0,)
-
     _, dsttype = gidx.metagraph.find_edge(0)
     v_shp = (gidx.number_of_nodes(dsttype), ) +\
         infer_broadcast_shape(op, u_shp[1:], e_shp[1:])
     v = F.zeros(v_shp, dtype, ctx)
     use_cmp = reduce_op in ['max', 'min']
     arg_u, arg_e = None, None
-    ugi = gidx.get_unitgraph(0, to_dgl_context(ctx))
-    idtype = getattr(F, ugi.dtype)
+    idtype = getattr(F, gidx.dtype)
     if use_cmp:
         if use_u:
             arg_u = F.zeros(v_shp, idtype, ctx)
         if use_e:
             arg_e = F.zeros(v_shp, idtype, ctx)
+    arg_u_nd = to_dgl_nd_for_write(arg_u)
+    arg_e_nd = to_dgl_nd_for_write(arg_e)
     if gidx.number_of_edges(0) > 0:
-        _CAPI_DGLKernelSpMM(ugi, op, reduce_op,
+        _CAPI_DGLKernelSpMM(gidx, op, reduce_op,
                             to_dgl_nd(u if use_u else None),
                             to_dgl_nd(e if use_e else None),
                             to_dgl_nd_for_write(v),
-                            to_dgl_nd_for_write(arg_u),
-                            to_dgl_nd_for_write(arg_e))
+                            arg_u_nd,
+                            arg_e_nd)
+    # NOTE(zihao): actually we can avoid the following step, because arg_*_nd
+    # refers to the data that stores arg_*. After we call _CAPI_DGLKernelSpMM,
+    # arg_* should have already been changed. But we found this doesn't work
+    # under Tensorflow when index type is int32. (arg_u and arg_e would be
+    # all zero).
+    # The workaround is proposed by Jinjing, and we still need to investigate
+    # where the problem is.
+    arg_u = None if arg_u is None else F.zerocopy_from_dgl_ndarray(arg_u_nd)
+    arg_e = None if arg_e is None else F.zerocopy_from_dgl_ndarray(arg_e_nd)
+    # To deal with scalar node/edge features.
+    if (expand_u or not use_u) and (expand_e or not use_e):
+        v = F.squeeze(v, -1)
+    if expand_u and use_cmp:
+        arg_u = F.squeeze(arg_u, -1)
+    if expand_e and use_cmp:
+        arg_e = F.squeeze(arg_e, -1)
     return v, (arg_u, arg_e)
+
 
 def _gsddmm(gidx, op, lhs, rhs, lhs_target='u', rhs_target='v'):
     r""" Generalized Sampled-Dense-Dense Matrix Multiplication interface. It
@@ -192,21 +217,26 @@ def _gsddmm(gidx, op, lhs, rhs, lhs_target='u', rhs_target='v'):
 
     Notes
     -----
-    This function does not handle gradients, and for scalar input features,
-    we expand its dimension with an additional dimension of length one. (e.g.
-    (90,) to (90, 1) for a graph with 90 nodes/edges).
+    This function does not handle gradients.
     """
     if gidx.number_of_etypes() != 1:
         raise DGLError("We only support gsddmm on graph with one edge type")
     use_lhs = op != 'copy_rhs'
     use_rhs = op != 'copy_lhs'
+    if use_lhs and use_rhs:
+        if F.dtype(lhs) != F.dtype(rhs):
+            raise DGLError("The operands data type don't match: {} and {}, please convert them"
+                           " to the same type.".format(F.dtype(lhs), F.dtype(rhs)))
+    # deal with scalar features.
+    expand_lhs, expand_rhs = False, False
     if use_lhs:
         if F.ndim(lhs) == 1:
             lhs = F.unsqueeze(lhs, -1)
+            expand_lhs = True
     if use_rhs:
         if F.ndim(rhs) == 1:
             rhs = F.unsqueeze(rhs, -1)
-
+            expand_rhs = True
     lhs_target = target_mapping[lhs_target]
     rhs_target = target_mapping[rhs_target]
     ctx = F.context(lhs) if use_lhs else F.context(rhs)
@@ -217,12 +247,243 @@ def _gsddmm(gidx, op, lhs, rhs, lhs_target='u', rhs_target='v'):
         infer_broadcast_shape(op, lhs_shp[1:], rhs_shp[1:])
     out = F.zeros(out_shp, dtype, ctx)
     if gidx.number_of_edges(0) > 0:
-        ugi = gidx.get_unitgraph(0, to_dgl_context(ctx))
-        _CAPI_DGLKernelSDDMM(ugi, op,
+        _CAPI_DGLKernelSDDMM(gidx, op,
                              to_dgl_nd(lhs if use_lhs else None),
                              to_dgl_nd(rhs if use_rhs else None),
                              to_dgl_nd_for_write(out),
                              lhs_target, rhs_target)
+    if (expand_lhs or not use_lhs) and (expand_rhs or not use_rhs):
+        out = F.squeeze(out, -1)
     return out
+
+
+def _segment_reduce(op, feat, offsets):
+    r"""Segment reduction operator.
+
+    It aggregates the value tensor along the first dimension by segments.
+    The argument ``offsets`` specifies the start offset of each segment (and
+    the upper bound of the last segment). Zero-length segments are allowed.
+
+    .. math::
+      y_i = \Phi_{j=\mathrm{offsets}_i}^{\mathrm{offsets}_{i+1}-1} x_j
+
+    where :math:`\Phi` is the reduce operator.
+
+    Parameters
+    ----------
+    op : str
+        Aggregation method. Can be ``sum``, ``max``, ``min``.
+    x : Tensor
+        Value to aggregate.
+    offsets : Tensor
+        The start offsets of segments.
+
+    Returns
+    -------
+    tuple(Tensor)
+        The first tensor correspond to aggregated tensor of shape
+        ``(len(seglen), value.shape[1:])``, and the second tensor records
+        the argmin/max at each position for computing gradients.
+
+    Notes
+    -----
+    This function does not handle gradients.
+    """
+    n = F.shape(offsets)[0] - 1
+    out_shp = (n,) + F.shape(feat)[1:]
+    ctx = F.context(feat)
+    dtype = F.dtype(feat)
+    idtype = F.dtype(offsets)
+    out = F.zeros(out_shp, dtype, ctx)
+    arg = None
+    if op in ['min', 'max']:
+        arg = F.zeros(out_shp, idtype, ctx)
+    arg_nd = to_dgl_nd_for_write(arg)
+    _CAPI_DGLKernelSegmentReduce(op,
+                                 to_dgl_nd(feat),
+                                 to_dgl_nd(offsets),
+                                 to_dgl_nd_for_write(out),
+                                 arg_nd)
+    arg = None if arg is None else F.zerocopy_from_dgl_ndarray(arg_nd)
+    return out, arg
+
+
+def _scatter_add(x, idx, m):
+    r""" Scatter add operator (on first dimension) implementation.
+
+    Math: y[idx[i], *] += x[i, *]
+
+    Parameters
+    ----------
+    x : Tensor
+        The input feature.
+    idx : Tensor
+        The indices array.
+    m : int
+        The length of output.
+
+    Returns
+    -------
+    Tensor
+        The output tensor.
+    """
+    out_shp = (m,) + F.shape(x)[1:]
+    ctx = F.context(x)
+    dtype = F.dtype(x)
+    out = F.zeros(out_shp, dtype, ctx)
+    _CAPI_DGLKernelScatterAdd(to_dgl_nd(x),
+                              to_dgl_nd(idx),
+                              to_dgl_nd_for_write(out))
+    return out
+
+
+def _bwd_segment_cmp(feat, arg, m):
+    r""" Backward phase of segment reduction (for 'min'/'max' reduction).
+
+    It computes the gradient of input feature given output gradient of
+    the segment reduction result.
+
+    Parameters
+    ----------
+    feat : Tensor
+        The output gradient
+    arg : Tensor
+        The ArgMin/Max tensor produced by segment_reduce op.
+    m : int
+        The length of input gradients' first dimension.
+
+    Returns
+    -------
+    Tensor
+        The input gradient.
+    """
+    out_shp = (m,) + F.shape(feat)[1:]
+    ctx = F.context(feat)
+    dtype = F.dtype(feat)
+    out = F.zeros(out_shp, dtype, ctx)
+    _CAPI_DGLKernelBwdSegmentCmp(to_dgl_nd(feat),
+                                 to_dgl_nd(arg),
+                                 to_dgl_nd_for_write(out))
+    return out
+
+class CSRMatrix(object):
+    """Device- and backend-agnostic sparse matrix in CSR format.
+
+    Parameters
+    ----------
+    data : Tensor
+        The data array.
+    indices : Tensor
+        The column indices array.
+    indptr : Tensor
+        The row index pointer array.
+    num_rows : int
+        The number of rows.
+    num_cols : int
+        The number of columns.
+    """
+    def __init__(self, data, indices, indptr, num_rows, num_cols):
+        self.indptr = indptr
+        self.indices = indices
+        self.data = data
+        self.shape = (num_rows, num_cols)
+
+def csrmm(A, B):
+    """Sparse-sparse matrix multiplication.
+
+    This is an internal function whose interface is subject to changes.
+
+    Parameters
+    ----------
+    A : dgl.sparse.CSRMatrix
+        The left operand
+    B : dgl.sparse.CSRMatrix
+        The right operand
+
+    Returns
+    -------
+    dgl.sparse.CSRMatrix
+        The result
+    """
+    A_indptr = F.zerocopy_from_numpy(A.indptr)
+    A_indices = F.zerocopy_from_numpy(A.indices)
+    A_data = F.zerocopy_from_numpy(A.data)
+    B_indptr = F.zerocopy_from_numpy(B.indptr)
+    B_indices = F.zerocopy_from_numpy(B.indices)
+    B_data = F.zerocopy_from_numpy(B.data)
+    C_indptr, C_indices, C_data = _CAPI_DGLCSRMM(
+        A.shape[0], A.shape[1], B.shape[1],
+        F.to_dgl_nd(A_indptr),
+        F.to_dgl_nd(A_indices),
+        F.to_dgl_nd(A_data),
+        F.to_dgl_nd(B_indptr),
+        F.to_dgl_nd(B_indices),
+        F.to_dgl_nd(B_data))
+    return CSRMatrix(
+        F.from_dgl_nd(C_data),
+        F.from_dgl_nd(C_indices),
+        F.from_dgl_nd(C_indptr),
+        A.shape[0],
+        B.shape[1])
+
+def csrsum(As):
+    """Sparse-sparse matrix summation.
+
+    This is an internal function whose interface is subject to changes.
+
+    Parameters
+    ----------
+    As : List[dgl.sparse.CSRMatrix]
+        List of scipy sparse matrices in CSR format.
+
+    Returns
+    -------
+    dgl.sparse.CSRMatrix
+        The result
+    """
+    A_indptr = [F.zerocopy_from_numpy(x.indptr) for x in As]
+    A_indices = [F.zerocopy_from_numpy(x.indices) for x in As]
+    A_data = [F.zerocopy_from_numpy(x.data) for x in As]
+    C_indptr, C_indices, C_data = _CAPI_DGLCSRSum(
+        As[0].shape[0], As[0].shape[1],
+        [F.to_dgl_nd(x) for x in A_indptr],
+        [F.to_dgl_nd(x) for x in A_indices],
+        [F.to_dgl_nd(x) for x in A_data])
+    return CSRMatrix(
+        F.from_dgl_nd(C_data),
+        F.from_dgl_nd(C_indices),
+        F.from_dgl_nd(C_indptr),
+        As[0].shape[0], As[0].shape[1])
+
+def csrmask(A, B):
+    """Sparse-sparse matrix masking operation that computes ``A[B != 0]``.
+
+    This is an internal function whose interface is subject to changes.
+
+    Parameters
+    ----------
+    A : dgl.sparse.CSRMatrix
+        The left operand
+    B : dgl.sparse.CSRMatrix
+        The right operand
+
+    Returns
+    -------
+    Tensor
+        The result
+    """
+    A_indptr = F.zerocopy_from_numpy(A.indptr)
+    A_indices = F.zerocopy_from_numpy(A.indices)
+    A_data = F.zerocopy_from_numpy(A.data)
+    B_indptr = F.zerocopy_from_numpy(B.indptr)
+    B_indices = F.zerocopy_from_numpy(B.indices)
+    B_data = _CAPI_DGLCSRMask(
+        A.shape[0], A.shape[1],
+        F.to_dgl_nd(A_indptr),
+        F.to_dgl_nd(A_indices),
+        F.to_dgl_nd(A_data),
+        F.to_dgl_nd(B_indptr),
+        F.to_dgl_nd(B_indices))
+    return F.from_dgl_nd(B_data)
 
 _init_api("dgl.sparse")

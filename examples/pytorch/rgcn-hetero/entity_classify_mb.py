@@ -7,13 +7,10 @@ import itertools
 import numpy as np
 import time
 import torch as th
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from functools import partial
 
 import dgl
-from dgl.data.rdf import AIFB, MUTAG, BGS, AM
+from dgl.data.rdf import AIFBDataset, MUTAGDataset, BGSDataset, AMDataset
 from model import EntityClassify, RelGraphEmbed
 
 def extract_embed(node_embed, input_nodes):
@@ -23,18 +20,17 @@ def extract_embed(node_embed, input_nodes):
         emb[ntype] = node_embed[ntype][nid]
     return emb
 
-def evaluate(model, loader, node_embed, labels, category, use_cuda):
+def evaluate(model, loader, node_embed, labels, category, device):
     model.eval()
     total_loss = 0
     total_acc = 0
     count = 0
     for input_nodes, seeds, blocks in loader:
+        blocks = [blk.to(device) for blk in blocks]
         seeds = seeds[category]
         emb = extract_embed(node_embed, input_nodes)
-        lbl = labels[seeds]
-        if use_cuda:
-            emb = {k : e.cuda() for k, e in emb.items()}
-            lbl = lbl.cuda()
+        emb = {k: e.to(device) for k, e in emb.items()}
+        lbl = labels[seeds].to(device)
         logits = model(emb, blocks)[category]
         loss = F.cross_entropy(logits, lbl)
         acc = th.sum(logits.argmax(dim=1) == lbl).item()
@@ -44,24 +40,33 @@ def evaluate(model, loader, node_embed, labels, category, use_cuda):
     return total_loss / count, total_acc / count
 
 def main(args):
+    # check cuda
+    device = 'cpu'
+    use_cuda = args.gpu >= 0 and th.cuda.is_available()
+    if use_cuda:
+        th.cuda.set_device(args.gpu)
+        device = 'cuda:%d' % args.gpu
+
     # load graph data
     if args.dataset == 'aifb':
-        dataset = AIFB()
+        dataset = AIFBDataset()
     elif args.dataset == 'mutag':
-        dataset = MUTAG()
+        dataset = MUTAGDataset()
     elif args.dataset == 'bgs':
-        dataset = BGS()
+        dataset = BGSDataset()
     elif args.dataset == 'am':
-        dataset = AM()
+        dataset = AMDataset()
     else:
         raise ValueError()
 
-    g = dataset.graph
+    g = dataset[0]
     category = dataset.predict_category
     num_classes = dataset.num_classes
-    train_idx = dataset.train_idx
-    test_idx = dataset.test_idx
-    labels = dataset.labels
+    train_mask = g.nodes[category].data.pop('train_mask')
+    test_mask = g.nodes[category].data.pop('test_mask')
+    train_idx = th.nonzero(train_mask, as_tuple=False).squeeze()
+    test_idx = th.nonzero(test_mask, as_tuple=False).squeeze()
+    labels = g.nodes[category].data.pop('labels')
 
     # split dataset into train, validate, test
     if args.validation:
@@ -70,17 +75,13 @@ def main(args):
     else:
         val_idx = train_idx
 
-    # check cuda
-    use_cuda = args.gpu >= 0 and th.cuda.is_available()
-    if use_cuda:
-        th.cuda.set_device(args.gpu)
-
-    train_label = labels[train_idx]
-    val_label = labels[val_idx]
-    test_label = labels[test_idx]
-
     # create embeddings
     embed_layer = RelGraphEmbed(g, args.n_hidden)
+
+    if not args.data_cpu:
+        labels = labels.to(device)
+        embed_layer = embed_layer.to(device)
+
     node_embed = embed_layer()
     # create model
     model = EntityClassify(g,
@@ -95,22 +96,16 @@ def main(args):
         model.cuda()
 
     # train sampler
-    sampler = dgl.sampling.MultiLayerNeighborSampler([args.fanout] * args.n_layers)
-    loader = dgl.sampling.NodeDataLoader(
+    sampler = dgl.dataloading.MultiLayerNeighborSampler([args.fanout] * args.n_layers)
+    loader = dgl.dataloading.NodeDataLoader(
         g, {category: train_idx}, sampler,
         batch_size=args.batch_size, shuffle=True, num_workers=0)
 
     # validation sampler
-    val_sampler = dgl.sampling.MultiLayerNeighborSampler([args.fanout] * args.n_layers)
-    val_loader = dgl.sampling.NodeDataLoader(
+    # we do not use full neighbor to save computation resources
+    val_sampler = dgl.dataloading.MultiLayerNeighborSampler([args.fanout] * args.n_layers)
+    val_loader = dgl.dataloading.NodeDataLoader(
         g, {category: val_idx}, val_sampler,
-        batch_size=args.batch_size, shuffle=True, num_workers=0)
-
-    # test sampler
-
-    test_sampler = dgl.sampling.MultiLayerNeighborSampler([args.fanout] * args.n_layers)
-    test_loader = dgl.sampling.NodeDataLoader(
-        g, {category: test_idx}, test_sampler,
         batch_size=args.batch_size, shuffle=True, num_workers=0)
 
     # optimizer
@@ -127,6 +122,7 @@ def main(args):
             t0 = time.time()
 
         for i, (input_nodes, seeds, blocks) in enumerate(loader):
+            blocks = [blk.to(device) for blk in blocks]
             seeds = seeds[category]     # we only predict the nodes with type "category"
             batch_tic = time.time()
             emb = extract_embed(node_embed, input_nodes)
@@ -146,7 +142,7 @@ def main(args):
         if epoch > 3:
             dur.append(time.time() - t0)
 
-        val_loss, val_acc = evaluate(model, val_loader, node_embed, labels, category, use_cuda)
+        val_loss, val_acc = evaluate(model, val_loader, node_embed, labels, category, device)
         print("Epoch {:05d} | Valid Acc: {:.4f} | Valid loss: {:.4f} | Time: {:.4f}".
               format(epoch, val_acc, val_loss, np.average(dur)))
     print()
@@ -189,6 +185,11 @@ if __name__ == '__main__':
             help="Mini-batch size. If -1, use full graph training.")
     parser.add_argument("--fanout", type=int, default=4,
             help="Fan-out of neighbor sampling.")
+    parser.add_argument('--data-cpu', action='store_true',
+            help="By default the script puts all node features and labels "
+                 "on GPU when using it to save time for data copy. This may "
+                 "be undesired if they cannot fit in GPU memory at once. "
+                 "This flag disables that.")
     fp = parser.add_mutually_exclusive_group(required=False)
     fp.add_argument('--validation', dest='validation', action='store_true')
     fp.add_argument('--testing', dest='validation', action='store_false')

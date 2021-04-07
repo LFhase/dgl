@@ -8,6 +8,7 @@
 
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "array.h"
 #include "./bcast.h"
@@ -28,15 +29,13 @@ namespace aten {
  * \param out_aux A list of NDArray's that contains auxiliary information such
  *        as the argmax on source nodes and edges for reduce operators such as
  *        `min` and `max`.
- * \param format The format of sparse matrix.
  */
 void SpMM(const std::string& op, const std::string& reduce,
           HeteroGraphPtr graph,
           NDArray ufeat,
           NDArray efeat,
           NDArray out,
-          std::vector<NDArray> out_aux,
-          SparseFormat format = SparseFormat::kAny);
+          std::vector<NDArray> out_aux);
 
 /*!
  * \brief Generalized Sampled Dense-Dense Matrix Multiplication.
@@ -46,14 +45,35 @@ void SpMM(const std::string& op, const std::string& reduce,
  * \param ufeat The source node feature.
  * \param vfeat The destination node feature.
  * \param out The output feature on edge.
- * \param format The format of sparse matrix.
  */
 void SDDMM(const std::string& op,
            HeteroGraphPtr graph,
            NDArray ufeat,
            NDArray efeat,
-           NDArray out,
-           SparseFormat format = SparseFormat::kAny);
+           NDArray out);
+
+/*!
+ * \brief Sparse-sparse matrix multiplication.
+ *
+ * \note B is transposed (i.e. in CSC format).
+ */
+std::pair<CSRMatrix, NDArray> CSRMM(
+    CSRMatrix A,
+    NDArray A_weights,
+    CSRMatrix B,
+    NDArray B_weights);
+
+/*!
+ * \brief Sparse-sparse matrix summation.
+ */
+std::pair<CSRMatrix, NDArray> CSRSum(
+    const std::vector<CSRMatrix>& A,
+    const std::vector<NDArray>& A_weights);
+
+/*!
+ * \brief Return a sparse matrix with the values of A but nonzero entry locations of B.
+ */
+NDArray CSRMask(const CSRMatrix& A, NDArray A_weights, const CSRMatrix& B);
 
 }  // namespace aten
 }  // namespace dgl
